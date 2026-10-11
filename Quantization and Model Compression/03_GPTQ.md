@@ -14,7 +14,7 @@ The original GPTQ paper, GPTQ: Accurate Post-Training Quantization for Generativ
 
 [image](https://www.google.com/s2/favicons?domain=https://arxiv.org\&sz=32)
 
-arXiv
+
 
 
 
