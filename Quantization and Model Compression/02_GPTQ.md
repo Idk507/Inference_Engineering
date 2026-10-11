@@ -833,7 +833,38 @@ Evaluate quality, pack weights, and serve through a compatible low-bit kernel.
 The following pseudocode captures the core update structure:
 
 ```
-# Conceptual GPTQ algorithm: not a complete runnable program.H = build_hessian(calibration_activations)H = regularize(H)U = upper_cholesky_factor_of_inverse(H)Q = empty_quantized_matrix()W_working = original_weights.copy()for block_start in range(0, num_columns, block_size):    block_end = min(block_start + block_size, num_columns)    errors = empty_error_matrix_for_block()    for j in range(block_start, block_end):        q = quantize(W_working[:, j])        error = (W_working[:, j] - q) / U[j, j]        Q[:, j] = q        errors[:, j - block_start] = error        # Compensate the current block immediately.        W_working[:, j:block_end] -= (            error[:, None] * U[j, j:block_end]        )    # Apply accumulated compensation to later blocks.    W_working[:, block_end:] -= (        errors @ U[block_start:block_end, block_end:]    )
+# Conceptual GPTQ algorithm: not a complete runnable program.
+
+H = build_hessian(calibration_activations)
+H = regularize(H)
+
+U = upper_cholesky_factor_of_inverse(H)
+
+Q = empty_quantized_matrix()
+W_working = original_weights.copy()
+
+for block_start in range(0, num_columns, block_size):
+    block_end = min(block_start + block_size, num_columns)
+
+    errors = empty_error_matrix_for_block()
+
+    for j in range(block_start, block_end):
+        q = quantize(W_working[:, j])
+
+        error = (W_working[:, j] - q) / U[j, j]
+
+        Q[:, j] = q
+        errors[:, j - block_start] = error
+
+        # Compensate the current block immediately.
+        W_working[:, j:block_end] -= (
+            error[:, None] * U[j, j:block_end]
+        )
+
+    # Apply accumulated compensation to later blocks.
+    W_working[:, block_end:] -= (
+        errors @ U[block_start:block_end, block_end:]
+    )
 ```
 
 This pseudocode assumes that the quantizer's scale parameters have been prepared and that `quantize` returns dequantized grid values for use in reconstruction. A real implementation must also store the corresponding integer codes, handle quantization-group boundaries, support optional permutations, and manage tensors in the appropriate device and dtype.
@@ -847,7 +878,326 @@ To isolate the GPTQ algorithm, we will use a fixed symmetric INT4 grid. Both met
 The implementation uses FP64 for the Hessian calculations because numerical clarity is more important than speed in this educational example. For simplicity, it processes all columns sequentially instead of applying the blocked optimization, and it uses one scale per output row.
 
 ```
-"""Educational GPTQ with second-order column compensation."""from dataclasses import dataclassimport torch@dataclassclass GPTQResult:    """Store the logical quantized codes and their reconstruction."""    codes: torch.Tensor    dequantized: torch.Tensor    scales: torch.Tensor    reconstruction_mse: floatdef validate_inputs(    weights: torch.Tensor,    inputs: torch.Tensor,) -> None:    """Validate the matrices used for GPTQ calibration."""    if not isinstance(weights, torch.Tensor):        raise TypeError("weights must be a PyTorch tensor.")    if not isinstance(inputs, torch.Tensor):        raise TypeError("inputs must be a PyTorch tensor.")    if weights.ndim != 2 or inputs.ndim != 2:        raise ValueError("Both matrices must be two-dimensional.")    if weights.shape[1] != inputs.shape[0]:        raise ValueError(            "Expected weights [out, in] and inputs [in, samples]."        )
+
+"""Educational GPTQ with second-order column compensation."""
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass
+class GPTQResult:
+    """Store the logical quantized codes and their reconstruction."""
+
+    codes: torch.Tensor
+    dequantized: torch.Tensor
+    scales: torch.Tensor
+    reconstruction_mse: float
+
+
+def validate_inputs(
+    weights: torch.Tensor,
+    inputs: torch.Tensor,
+) -> None:
+    """Validate the matrices used for GPTQ calibration."""
+    if not isinstance(weights, torch.Tensor):
+        raise TypeError("weights must be a PyTorch tensor.")
+
+    if not isinstance(inputs, torch.Tensor):
+        raise TypeError("inputs must be a PyTorch tensor.")
+
+    if weights.ndim != 2 or inputs.ndim != 2:
+        raise ValueError("Both matrices must be two-dimensional.")
+
+    if weights.shape[1] != inputs.shape[0]:
+        raise ValueError(
+            "Expected weights [out, in] and inputs [in, samples]."
+        )
+
+    if weights.numel() == 0 or inputs.numel() == 0:
+        raise ValueError("Input tensors must not be empty.")
+
+    if not weights.is_floating_point() or not inputs.is_floating_point():
+        raise TypeError("Both tensors must use floating-point dtypes.")
+
+    if weights.device != inputs.device:
+        raise ValueError("Weights and inputs must be on the same device.")
+
+    if not torch.isfinite(weights).all().item():
+        raise ValueError("Weights contain nonfinite values.")
+
+    if not torch.isfinite(inputs).all().item():
+        raise ValueError("Calibration inputs contain nonfinite values.")
+
+
+def calculate_scales(
+    weights: torch.Tensor,
+    bits: int,
+) -> torch.Tensor:
+    """Calculate symmetric row-wise scales."""
+    if not isinstance(bits, int) or not 2 <= bits <= 8:
+        raise ValueError("bits must be an integer from 2 to 8.")
+
+    qmax = (1 << (bits - 1)) - 1
+
+    max_abs = weights.abs().amax(dim=1, keepdim=True)
+
+    # Use a scale of one for entirely zero-valued rows.
+    return torch.where(
+        max_abs > 0,
+        max_abs / qmax,
+        torch.ones_like(max_abs),
+    )
+
+
+def quantize_values(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    bits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return logical integer codes and dequantized grid values."""
+    qmax = (1 << (bits - 1)) - 1
+
+    codes = torch.round(values / scales)
+    codes = codes.clamp(-qmax, qmax).to(torch.int8)
+
+    reconstructed = codes.to(values.dtype) * scales
+    return codes, reconstructed
+
+
+def output_mse(
+    original: torch.Tensor,
+    reconstructed: torch.Tensor,
+    inputs: torch.Tensor,
+) -> float:
+    """Calculate calibration-output mean squared error."""
+    reference_outputs = original @ inputs
+    quantized_outputs = reconstructed @ inputs
+
+    return torch.mean(
+        (reference_outputs - quantized_outputs).square()
+    ).item()
+
+
+def round_to_nearest(
+    weights: torch.Tensor,
+    inputs: torch.Tensor,
+    bits: int = 4,
+) -> GPTQResult:
+    """Quantize independently without second-order compensation."""
+    validate_inputs(weights, inputs)
+
+    w = weights.detach().to(torch.float64)
+    x = inputs.detach().to(torch.float64)
+
+    scales = calculate_scales(w, bits)
+    codes, recovered = quantize_values(w, scales, bits)
+
+    return GPTQResult(
+        codes=codes,
+        dequantized=recovered,
+        scales=scales,
+        reconstruction_mse=output_mse(w, recovered, x),
+    )
+
+
+def gptq_reference(
+    weights: torch.Tensor,
+    inputs: torch.Tensor,
+    bits: int = 4,
+    damp_percent: float = 0.01,
+) -> GPTQResult:
+    """
+    Perform simplified sequential GPTQ on a linear weight matrix.
+
+    Notes:
+        Uses per-row symmetric quantization and fixed scales.
+        Uses double precision and unblocked sequential updates.
+        Returns unpacked logical codes, not a deployable INT4 file.
+
+    Args:
+        weights: Matrix [out_features, in_features].
+        inputs: Calibration inputs [in_features, samples].
+        bits: Integer precision, 2 through 8.
+        damp_percent: Diagonal regularization fraction.
+
+    Raises:
+        ValueError: Invalid calibration or regularization values.
+        RuntimeError: Cholesky factorization cannot be completed.
+    """
+    validate_inputs(weights, inputs)
+
+    if not isinstance(bits, int) or not 2 <= bits <= 8:
+        raise ValueError("bits must be between 2 and 8.")
+
+    if not isinstance(damp_percent, (float, int)):
+        raise TypeError("damp_percent must be numeric.")
+
+    if damp_percent <= 0:
+        raise ValueError("damp_percent must be positive.")
+
+    w_original = weights.detach().to(torch.float64)
+    x = inputs.detach().to(torch.float64)
+
+    rows, cols = w_original.shape
+
+    # Build the normalized quadratic form from calibration inputs.
+    hessian = (2.0 / x.shape[1]) * (x @ x.T)
+
+    # Stabilize the matrix using diagonal damping.
+    damping = (
+        float(damp_percent)
+        * hessian.diagonal().mean().item()
+    )
+
+    if damping <= 0:
+        raise ValueError(
+            "Calibration inputs contain no usable signal."
+        )
+
+    identity = torch.eye(
+        cols,
+        device=w_original.device,
+        dtype=w_original.dtype,
+    )
+    hessian = hessian + damping * identity
+
+    try:
+        # Factor H, then solve for its inverse rather than using
+        # an explicit generic inverse operation.
+        h_cholesky = torch.linalg.cholesky(hessian)
+        h_inverse = torch.cholesky_inverse(h_cholesky)
+
+        # U.T @ U = inverse(H).
+        upper = torch.linalg.cholesky(
+            h_inverse
+        ).transpose(-1, -2).contiguous()
+
+    except torch.linalg.LinAlgError as exc:
+        raise RuntimeError(
+            "Unable to factor the regularized Hessian."
+        ) from exc
+
+    scales = calculate_scales(w_original, bits)
+
+    working = w_original.clone()
+    codes = torch.empty(
+        (rows, cols),
+        dtype=torch.int8,
+        device=w_original.device,
+    )
+    dequantized = torch.empty_like(w_original)
+
+    # Sequentially quantize each input-feature column.
+    for column in range(cols):
+        current = working[:, column:column + 1]
+
+        integer_codes, quantized_values = quantize_values(
+            current,
+            scales,
+            bits,
+        )
+
+        codes[:, column:column + 1] = integer_codes
+        dequantized[:, column:column + 1] = quantized_values
+
+        diagonal = upper[column, column]
+
+        if diagonal <= 0 or not torch.isfinite(diagonal):
+            raise RuntimeError(
+                f"Invalid factor diagonal at column {column}."
+            )
+
+        # The normalized error determines compensation.
+        error = (current - quantized_values) / diagonal
+
+        # Update only currently free and future columns.
+        working[:, column:] -= (
+            error * upper[column, column:].unsqueeze(0)
+        )
+
+    return GPTQResult(
+        codes=codes,
+        dequantized=dequantized,
+        scales=scales,
+        reconstruction_mse=output_mse(
+            w_original,
+            dequantized,
+            x,
+        ),
+    )
+
+
+def main() -> None:
+    """Run and compare INT4 round-to-nearest and GPTQ."""
+    torch.manual_seed(42)
+
+    # A modest example that can run on CPU.
+    output_features = 32
+    input_features = 64
+    calibration_samples = 512
+
+    weights = torch.randn(
+        output_features,
+        input_features,
+        dtype=torch.float64,
+    ) * 0.2
+
+    # Generate correlated calibration features.
+    latent = torch.randn(
+        8,
+        calibration_samples,
+        dtype=torch.float64,
+    )
+    mixing = torch.randn(
+        input_features,
+        8,
+        dtype=torch.float64,
+    )
+
+    inputs = mixing @ latent
+    inputs += 0.05 * torch.randn_like(inputs)
+
+    baseline = round_to_nearest(weights, inputs, bits=4)
+
+    optimized = gptq_reference(
+        weights,
+        inputs,
+        bits=4,
+        damp_percent=0.01,
+    )
+
+    print("Ordinary INT4 reconstruction MSE:")
+    print(f"{baseline.reconstruction_mse:.8f}")
+
+    print("GPTQ INT4 reconstruction MSE:")
+    print(f"{optimized.reconstruction_mse:.8f}")
+
+    if baseline.reconstruction_mse > 0:
+        improvement = (
+            1.0
+            - optimized.reconstruction_mse
+            / baseline.reconstruction_mse
+        ) * 100.0
+        print(f"Relative MSE improvement: {improvement:.2f}%")
+
+    assert optimized.codes.shape == weights.shape
+    assert torch.isfinite(optimized.dequantized).all()
+    assert torch.equal(
+        optimized.codes,
+        optimized.codes.clamp(-7, 7),
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, TypeError, RuntimeError) as exc:
+        raise SystemExit(
+            f"GPTQ experiment failed: {exc}"
+        ) from exc
+
 ```
 
 ### What this implementation demonstrates
