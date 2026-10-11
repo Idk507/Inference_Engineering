@@ -60,23 +60,7 @@ The layer's output is unchanged in exact arithmetic.
 
 This is the key identity behind AWQ.
 
-Equivalent linear transformations
-
-Original operation
-
-\\(X\\)
-
-\\(W^\top\\)
-
-Y
-
-AWQ transformation
-
-\\(X D^{-1}\\)
-
-\\((W D)^\top\\)
-
-Same Y
+<img width="472" height="292" alt="image" src="https://github.com/user-attachments/assets/0d89a588-9dbd-45c4-9b5a-f4a6fffd6ace" />
 
 The identity holds before quantization; finite-precision rounding can introduce tiny differences in practice.
 
@@ -201,7 +185,7 @@ Output error before and after rescaling
 
 Two-weight illustrative example using symmetric INT4
 
-0246Naive INT4Rescaled INT4
+<img width="520" height="271" alt="image" src="https://github.com/user-attachments/assets/609c51d4-92f3-4c8c-bfca-901d09166aae" />
 
 This example reduces output error by approximately 91.4%, without changing the original floating-point function.
 
