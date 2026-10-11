@@ -135,26 +135,7 @@ Therefore, two quantized models with similar weight MSE can have different outpu
 GPTQ uses the geometry of this objective to decide how the remaining weights should change.
 
 ### Weight error versus output error
-
-Ordinary quantization
-
-Original weights W
-
-Round to nearest levels
-
-Quantized weights Wq
-
-Local numerical approximation, without compensating future weights.
-
-GPTQ
-
-Weights W + calibration X
-
-Quantize + compensate
-
-Quantized weights Wq
-
-Uses input statistics to reduce the resulting layer-output distortion.
+<img width="506" height="227" alt="image" src="https://github.com/user-attachments/assets/e7b88baa-4f01-4bc8-a203-975c60ad1e49" />
 
 ## 3. Why does GPTQ need a Hessian?
 
@@ -535,10 +516,6 @@ The original GPTQ implementation exposes these design choices through its `faste
 
 [image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
 
-GitHub
-
-+1
-
 
 
 ## 7. Why the algorithm operates column by column
@@ -571,36 +548,8 @@ Next, it computes the quantization errors associated with this column and modifi
 It then processes `c1`, `c2`, and so forth.
 
 Interactive GPTQ column progression
+<img width="480" height="290" alt="image" src="https://github.com/user-attachments/assets/af0b7d31-7555-4828-acd8-270247f7a4b3" />
 
-Current column
-
-3 of 6
-
-c0
-
-c2
-
-c5
-
-c0
-
-c1
-
-c2
-
-c3
-
-c4
-
-c5
-
-Already quantized
-
-Current column
-
-Still adjustable
-
-Columns c0 through c1 are fixed. GPTQ quantizes c2 and uses the remaining 3 columns to absorb its error.
 
 This ordering matters because compensation can only modify weights that have not yet been quantized.
 
@@ -764,7 +713,7 @@ The implementation must also handle input dimensions with no observed activity. 
 
 [image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
 
-GitHub
+
 
 
 
@@ -808,21 +757,8 @@ This preserves the intended sequential dependencies while improving GPU efficien
 
 Blocked GPTQ execution
 
-Illustrative matrix divided into four column blocks
+<img width="482" height="243" alt="image" src="https://github.com/user-attachments/assets/906487fe-1059-4406-9c84-1af5bb8066c4" />
 
-Block 1
-
-Block 2
-
-Block 3
-
-Block 4
-
-Processing block 2
-
-Blocks 1–1 are fixed. Columns within block 2 are processed sequentially, and their accumulated corrections are applied to later blocks in one matrix operation.
-
-Select a block to examine the progression. The illustrated local column position is schematic.
 
 ### 10.2 The delayed update equation
 
@@ -854,63 +790,43 @@ A common configuration uses 128 for both, but they solve entirely different prob
 
 We can now assemble the whole algorithm.
 
-1
-
-Calibration
+1 Calibration
 
 Collect representative layer-input activations X.
 
-2
-
-Hessian construction
+2 Hessian construction
 
 Compute an input-space curvature approximation, proportional to X × X.T.
 
-3
-
-Numerical stabilization
+3 Numerical stabilization
 
 Handle inactive features and apply diagonal damping.
 
-4
-
-Matrix factorization
+4 Matrix factorization
 
 Compute the upper-triangular factor U of the inverse regularized Hessian.
 
-5
-
-Column ordering
+5 Column ordering
 
 Select the shared order, optionally using activation-order reordering.
 
-6
-
-Column quantization
+6 Column quantization
 
 Map the current adjusted weight column to the low-bit grid.
 
-7
-
-Error compensation
+7 Error compensation
 
 Use U to redistribute the rounding error over remaining free columns.
 
-8
-
-Lazy block update
+8 Lazy block update
 
 Accumulate corrections and update distant columns with matrix multiplication.
 
-9
-
-Quantized representation
+9 Quantized representation
 
 Store integer codes, scales, zero-points, and required layout metadata.
 
-10
-
-Validation and deployment
+10 Validation and deployment
 
 Evaluate quality, pack weights, and serve through a compatible low-bit kernel.
 
@@ -1085,7 +1001,7 @@ This distinction is extremely important.
 
 The deployment architecture looks like this:
 
-Offline GPTQ preparation
+**Offline GPTQ preparation**
 
 Original BF16/FP16 model
 
@@ -1101,7 +1017,7 @@ Packed low-bit checkpoint
 
 Integer weights + scales + zero-points + metadata
 
-Online inference
+**Online inference**
 
 Inference engine
 
