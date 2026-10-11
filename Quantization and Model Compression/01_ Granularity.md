@@ -879,7 +879,232 @@ The implementation below supports arbitrary two-dimensional weight matrices, sig
 This is a reference implementation for numerical experimentation. It deliberately does not pack INT4 values into physical four-bit storage or implement a fused GPU kernel; a normal PyTorch integer tensor still consumes its underlying integer datatype's storage.
 
 ```
-"""Reference implementation of symmetric quantization granularities."""from dataclasses import dataclassimport torch@dataclassclass QuantizationResult:    """Hold integer codes, reconstructed weights, and quantization scales."""    quantized: torch.Tensor    reconstructed: torch.Tensor    scales: torch.Tensor    bits: int    granularity: strdef symmetric_quantize(    weights: torch.Tensor,    bits: int = 8,    granularity: str = "per_tensor",    group_size: int = 128,) -> QuantizationResult:    """    Quantize a 2D floating-point weight matrix using symmetric quantization.    Args:        weights: Weight matrix [out_features, in_features].        bits: Signed integer precision, between 2 and 8.        granularity: per_tensor, per_channel, or per_group.        group_size: Number of input-feature weights in each group.    Returns:        QuantizationResult with logical integer codes, scales,
+
+"""Reference implementation of symmetric quantization granularities."""
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass
+class QuantizationResult:
+    """Hold integer codes, reconstructed weights, and quantization scales."""
+
+    quantized: torch.Tensor
+    reconstructed: torch.Tensor
+    scales: torch.Tensor
+    bits: int
+    granularity: str
+
+
+def symmetric_quantize(
+    weights: torch.Tensor,
+    bits: int = 8,
+    granularity: str = "per_tensor",
+    group_size: int = 128,
+) -> QuantizationResult:
+    """
+    Quantize a 2D floating-point weight matrix using symmetric quantization.
+
+    Args:
+        weights: Weight matrix [out_features, in_features].
+        bits: Signed integer precision, between 2 and 8.
+        granularity: per_tensor, per_channel, or per_group.
+        group_size: Number of input-feature weights in each group.
+
+    Returns:
+        QuantizationResult with logical integer codes, scales,
+        and dequantized weights.
+
+    Raises:
+        TypeError: For unsupported input types or dtypes.
+        ValueError: For invalid shapes, configuration, or nonfinite values.
+    """
+    if not isinstance(weights, torch.Tensor):
+        raise TypeError("weights must be a torch.Tensor.")
+
+    if weights.ndim != 2 or weights.numel() == 0:
+        raise ValueError("weights must be a nonempty 2D matrix.")
+
+    if not weights.is_floating_point():
+        raise TypeError("weights must contain floating-point values.")
+
+    if bits not in range(2, 9):
+        raise ValueError("bits must be between 2 and 8.")
+
+    valid = {"per_tensor", "per_channel", "per_group"}
+
+    if granularity not in valid:
+        raise ValueError(f"granularity must be one of {sorted(valid)}.")
+
+    if not isinstance(group_size, int) or group_size <= 0:
+        raise ValueError("group_size must be a positive integer.")
+
+    # Use FP32 for calibration even if source weights are FP16.
+    w = weights.detach().to(torch.float32)
+
+    if not torch.isfinite(w).all().item():
+        raise ValueError("weights must contain only finite values.")
+
+    # Symmetric signed range: [-Q, Q].
+    # For INT4, this uses [-7, 7], leaving -8 unused.
+    qmax = (1 << (bits - 1)) - 1
+    qmin = -qmax
+
+    rows, cols = w.shape
+
+    def quantize_region(
+        region: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize a region with its own max-absolute scale."""
+        max_abs = region.abs().amax()
+        scale = max_abs / qmax
+
+        # Avoid division by zero for an entirely zero-valued region.
+        safe_scale = torch.where(
+            scale > 0,
+            scale,
+            torch.ones_like(scale),
+        )
+
+        codes = torch.round(region / safe_scale)
+        codes = codes.clamp(qmin, qmax).to(torch.int8)
+        recovered = codes.to(torch.float32) * safe_scale
+
+        return codes, recovered, safe_scale
+
+    if granularity == "per_tensor":
+        codes, recovered, scale = quantize_region(w)
+        scales = scale.reshape(1)
+
+    elif granularity == "per_channel":
+        # One calibration region per output-feature row.
+        codes = torch.empty_like(w, dtype=torch.int8)
+        recovered = torch.empty_like(w)
+        scales = torch.empty(rows, dtype=torch.float32, device=w.device)
+
+        for row in range(rows):
+            q, r, s = quantize_region(w[row])
+            codes[row] = q
+            recovered[row] = r
+            scales[row] = s
+
+    else:
+        # Split each output-feature row along the input-feature axis.
+        num_groups = (cols + group_size - 1) // group_size
+
+        codes = torch.empty_like(w, dtype=torch.int8)
+        recovered = torch.empty_like(w)
+        scales = torch.empty(
+            (rows, num_groups),
+            dtype=torch.float32,
+            device=w.device,
+        )
+
+        for row in range(rows):
+            for group in range(num_groups):
+                start = group * group_size
+                end = min(start + group_size, cols)
+
+                q, r, s = quantize_region(w[row, start:end])
+
+                codes[row, start:end] = q
+                recovered[row, start:end] = r
+                scales[row, group] = s
+
+    return QuantizationResult(
+        quantized=codes,
+        reconstructed=recovered,
+        scales=scales,
+        bits=bits,
+        granularity=granularity,
+    )
+
+
+def evaluate_quantization(
+    reference: torch.Tensor,
+    result: QuantizationResult,
+) -> dict[str, float]:
+    """Compute reconstruction error statistics for a quantized matrix."""
+    if reference.shape != result.reconstructed.shape:
+        raise ValueError("Reference and reconstructed shapes must match.")
+
+    original = reference.to(torch.float32)
+    diff = original - result.reconstructed
+
+    mse = diff.square().mean()
+    mae = diff.abs().mean()
+    max_error = diff.abs().amax()
+
+    denominator = original.square().sum().clamp_min(1e-12)
+    relative_squared_error = diff.square().sum() / denominator
+
+    return {
+        "mse": mse.item(),
+        "mae": mae.item(),
+        "max_absolute_error": max_error.item(),
+        "relative_squared_error": relative_squared_error.item(),
+        "num_scales": float(result.scales.numel()),
+    }
+
+
+def run_experiment() -> None:
+    """Compare symmetric quantization at multiple granularities."""
+    torch.manual_seed(42)
+
+    # Construct channels with very different numerical ranges.
+    rows, cols = 128, 512
+
+    w = torch.randn(rows, cols, dtype=torch.float32)
+
+    # Make channel magnitudes vary exponentially.
+    channel_scales = torch.logspace(-2, 1, steps=rows)
+    w = w * channel_scales[:, None]
+
+    # Add outliers to a few channels.
+    w[0, 0] = 25.0
+    w[50, 300] = -15.0
+
+    configurations = [
+        ("per_tensor", 128),
+        ("per_channel", 128),
+        ("per_group", 128),
+        ("per_group", 64),
+        ("per_group", 32),
+    ]
+
+    print(f"{'Granularity':<20} {'MSE':>14} {'Scales':>10}")
+
+    for granularity, group_size in configurations:
+        result = symmetric_quantize(
+            w,
+            bits=4,
+            granularity=granularity,
+            group_size=group_size,
+        )
+
+        metrics = evaluate_quantization(w, result)
+
+        name = (
+            f"{granularity}:{group_size}"
+            if granularity == "per_group"
+            else granularity
+        )
+
+        print(
+            f"{name:<20} "
+            f"{metrics['mse']:>14.8f} "
+            f"{int(metrics['num_scales']):>10}"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        run_experiment()
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"Quantization experiment failed: {exc}") from exc
+
 ```
 
 When you run this experiment, compare the reconstruction MSE and number of scales. Because the tensor contains deliberate outliers and strong differences between channel magnitudes, it highlights the weaknesses of sharing one quantization scale across unrelated numerical distributions.
